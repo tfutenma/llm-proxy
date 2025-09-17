@@ -1,22 +1,27 @@
 # Arquitetura Hexagonal - Exemplo Prático Completo
 
-## 🎯 Domínio de Exemplo: Sistema de Biblioteca Digital
+## 🎯 Domínio de Exemplo: Sistema de Gerenciamento de Modelos LLM
 
-Vamos implementar um sistema de biblioteca digital para demonstrar todos os conceitos da arquitetura hexagonal. Este exemplo é suficientemente complexo para mostrar todos os padrões, mas simples o suficiente para ser compreendido facilmente.
+Vamos implementar um sistema de gerenciamento de modelos LLM para demonstrar todos os conceitos da arquitetura hexagonal aplicados ao contexto de um proxy LLM. Este exemplo mostra como gerenciar modelos de diferentes provedores de IA com suas configurações, custos e operações suportadas.
 
 ### 📋 Requisitos do Sistema
 
 **Funcionalidades Core:**
-- Gerenciar livros (criar, buscar, atualizar)
-- Gerenciar empréstimos de livros
-- Notificar usuários sobre vencimentos
-- Gerar relatórios de empréstimos
+- Gerenciar modelos LLM (criar, buscar, atualizar, deletar)
+- Listar modelos por provedor (Azure, OpenAI, Anthropic, etc.)
+- Listar modelos por tipo (AzureOpenAI, OpenAI, AnthropicVertex, etc.)
+- Listar modelos por operação suportada (ChatCompletion, Embeddings, etc.)
+- Buscar modelo por nome, ID ou deployment_name
+- Controlar acesso por projetos e privacidade
+- Gerenciar custos e parâmetros de configuração
 
 **Regras de Negócio:**
-- Um livro pode ter múltiplas cópias
-- Empréstimos têm prazo de 14 dias
-- Usuários podem ter no máximo 3 livros emprestados
-- Notificações são enviadas 2 dias antes do vencimento
+- Cada modelo deve ter um ID único
+- Modelos podem ser públicos ou privados
+- Modelos privados são restritos a projetos específicos
+- Cada modelo possui configurações específicas do provedor
+- Custos são calculados por token de entrada e saída
+- Operações suportadas variam por modelo e provedor
 
 ## 🏗️ Racional da Arquitetura Hexagonal
 
@@ -30,7 +35,7 @@ Vamos implementar um sistema de biblioteca digital para demonstrar todos os conc
 ### Estrutura das Camadas
 
 ```
-📁 library_system/
+📁 llm_model_management/
 ├── 📁 domain/              # CORE - Lógica de Negócio
 │   ├── entities/           # Entidades do domínio
 │   ├── value_objects/      # Objetos de valor
@@ -41,9 +46,9 @@ Vamos implementar um sistema de biblioteca digital para demonstrar todos os conc
 │   ├── ports/              # Interfaces (Ports)
 │   └── services/           # Serviços de aplicação
 ├── 📁 infrastructure/      # ADAPTADORES
-│   ├── persistence/        # Adaptadores de banco de dados
-│   ├── web/                # Adaptadores HTTP
-│   ├── notifications/      # Adaptadores de notificação
+│   ├── persistence/        # Adaptadores de banco de dados (CosmosDB)
+│   ├── web/                # Adaptadores HTTP (FastAPI)
+│   ├── cache/              # Adaptadores de cache
 │   └── config/             # Configurações
 └── 📁 tests/               # Testes automatizados
     ├── unit/               # Testes unitários
@@ -55,381 +60,404 @@ Vamos implementar um sistema de biblioteca digital para demonstrar todos os conc
 
 ### 1. Camada de Domínio (Core)
 
-#### `domain/entities/book.py`
+#### `domain/entities/llm_model.py`
 ```python
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from uuid import UUID, uuid4
 
-from ..value_objects.isbn import ISBN
-from ..value_objects.book_status import BookStatus
+from ..value_objects.model_parameters import ModelParameters
+from ..value_objects.cost_info import CostInfo
+from ..value_objects.model_status import ModelStatus
 
 @dataclass
-class Book:
-    """Entidade central do domínio: Livro"""
+class LLMModel:
+    """Entidade central do domínio: Modelo LLM"""
 
-    id: UUID = field(default_factory=uuid4)
-    title: str = ""
-    author: str = ""
-    isbn: ISBN = field(default_factory=lambda: ISBN(""))
-    total_copies: int = 0
-    available_copies: int = 0
+    id: str
+    name: str
+    code: str
+    provider: str
+    model_type: str
+    parameters: ModelParameters
+    costs: CostInfo
+    operations: List[str] = field(default_factory=list)
+    projects: List[str] = field(default_factory=list)
+    private: bool = False
+    active: bool = True
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
     def __post_init__(self):
-        if not self.title:
-            raise ValueError("Título é obrigatório")
-        if not self.author:
-            raise ValueError("Autor é obrigatório")
-        if self.total_copies < 0:
-            raise ValueError("Total de cópias deve ser positivo")
-        if self.available_copies > self.total_copies:
-            raise ValueError("Cópias disponíveis não pode exceder total")
-
-    def is_available(self) -> bool:
-        """Verifica se há cópias disponíveis para empréstimo"""
-        return self.available_copies > 0
-
-    def borrow_copy(self) -> None:
-        """Empresta uma cópia do livro"""
-        if not self.is_available():
-            raise ValueError(f"Livro '{self.title}' não possui cópias disponíveis")
-        self.available_copies -= 1
-        self.updated_at = datetime.utcnow()
-
-    def return_copy(self) -> None:
-        """Devolve uma cópia do livro"""
-        if self.available_copies >= self.total_copies:
-            raise ValueError(f"Todas as cópias do livro '{self.title}' já foram devolvidas")
-        self.available_copies += 1
-        self.updated_at = datetime.utcnow()
-
-    def add_copies(self, quantity: int) -> None:
-        """Adiciona cópias ao acervo"""
-        if quantity <= 0:
-            raise ValueError("Quantidade deve ser positiva")
-        self.total_copies += quantity
-        self.available_copies += quantity
-        self.updated_at = datetime.utcnow()
-
-    def get_status(self) -> BookStatus:
-        """Retorna o status atual do livro"""
-        if self.available_copies == 0:
-            return BookStatus.UNAVAILABLE
-        elif self.available_copies == self.total_copies:
-            return BookStatus.AVAILABLE
-        else:
-            return BookStatus.PARTIALLY_AVAILABLE
-```
-
-#### `domain/entities/user.py`
-```python
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import List
-from uuid import UUID, uuid4
-
-from ..value_objects.email import Email
-
-@dataclass
-class User:
-    """Entidade: Usuário da biblioteca"""
-
-    id: UUID = field(default_factory=uuid4)
-    name: str = ""
-    email: Email = field(default_factory=lambda: Email(""))
-    max_borrowed_books: int = 3
-    created_at: datetime = field(default_factory=datetime.utcnow)
-
-    def __post_init__(self):
+        if not self.id:
+            raise ValueError("ID é obrigatório")
         if not self.name:
             raise ValueError("Nome é obrigatório")
-        if self.max_borrowed_books <= 0:
-            raise ValueError("Limite de livros deve ser positivo")
+        if not self.code:
+            raise ValueError("Código é obrigatório")
+        if not self.provider:
+            raise ValueError("Provedor é obrigatório")
+        if not self.model_type:
+            raise ValueError("Tipo do modelo é obrigatório")
+        if not self.operations:
+            raise ValueError("Pelo menos uma operação deve ser suportada")
 
-    def can_borrow_more_books(self, current_loans: int) -> bool:
-        """Verifica se o usuário pode emprestar mais livros"""
-        return current_loans < self.max_borrowed_books
+    def is_accessible_by_project(self, project_id: str) -> bool:
+        """Verifica se o modelo é acessível pelo projeto"""
+        if not self.private:
+            return True
+        return project_id in self.projects
 
-    def get_remaining_loan_capacity(self, current_loans: int) -> int:
-        """Retorna quantos livros o usuário ainda pode emprestar"""
-        return max(0, self.max_borrowed_books - current_loans)
+    def supports_operation(self, operation: str) -> bool:
+        """Verifica se o modelo suporta a operação"""
+        return operation in self.operations
+
+    def add_project(self, project_id: str) -> None:
+        """Adiciona projeto ao modelo"""
+        if project_id not in self.projects:
+            self.projects.append(project_id)
+            self.updated_at = datetime.utcnow()
+
+    def remove_project(self, project_id: str) -> None:
+        """Remove projeto do modelo"""
+        if project_id in self.projects:
+            self.projects.remove(project_id)
+            self.updated_at = datetime.utcnow()
+
+    def update_parameters(self, new_parameters: Dict[str, Any]) -> None:
+        """Atualiza parâmetros do modelo"""
+        self.parameters = ModelParameters.from_dict(new_parameters)
+        self.updated_at = datetime.utcnow()
+
+    def update_costs(self, input_cost: float, output_cost: float, currency: str = "USD") -> None:
+        """Atualiza custos do modelo"""
+        self.costs = CostInfo(currency, input_cost, output_cost)
+        self.updated_at = datetime.utcnow()
+
+    def deactivate(self) -> None:
+        """Desativa o modelo"""
+        self.active = False
+        self.updated_at = datetime.utcnow()
+
+    def activate(self) -> None:
+        """Ativa o modelo"""
+        self.active = True
+        self.updated_at = datetime.utcnow()
+
+    def get_status(self) -> ModelStatus:
+        """Retorna o status atual do modelo"""
+        if not self.active:
+            return ModelStatus.INACTIVE
+        elif self.private and not self.projects:
+            return ModelStatus.PRIVATE_NO_PROJECTS
+        elif self.private:
+            return ModelStatus.PRIVATE
+        else:
+            return ModelStatus.PUBLIC
 ```
 
-#### `domain/entities/loan.py`
+#### `domain/value_objects/model_parameters.py`
 ```python
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+
+@dataclass(frozen=True)
+class ModelParameters:
+    """Value Object: Parâmetros de configuração do modelo"""
+
+    secret_name: str
+    deployment_name: Optional[str] = None
+    api_version: Optional[str] = None
+    endpoint: Optional[str] = None
+    enable_tools: bool = False
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    additional_params: Dict[str, Any] = None
+
+    def __post_init__(self):
+        if not self.secret_name:
+            raise ValueError("Secret name é obrigatório")
+
+        if self.additional_params is None:
+            object.__setattr__(self, 'additional_params', {})
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ModelParameters":
+        """Cria ModelParameters a partir de dicionário"""
+        known_fields = {
+            'secret_name', 'deployment_name', 'api_version',
+            'endpoint', 'enable_tools', 'max_tokens', 'temperature'
+        }
+
+        # Separa campos conhecidos dos adicionais
+        known_params = {k: v for k, v in data.items() if k in known_fields}
+        additional_params = {k: v for k, v in data.items() if k not in known_fields}
+
+        return cls(
+            **known_params,
+            additional_params=additional_params
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        result = {
+            "secret_name": self.secret_name,
+            "enable_tools": self.enable_tools
+        }
+
+        if self.deployment_name:
+            result["deployment_name"] = self.deployment_name
+        if self.api_version:
+            result["api_version"] = self.api_version
+        if self.endpoint:
+            result["endpoint"] = self.endpoint
+        if self.max_tokens:
+            result["max_tokens"] = self.max_tokens
+        if self.temperature:
+            result["temperature"] = self.temperature
+
+        result.update(self.additional_params)
+        return result
+
+    def get_deployment_name(self) -> Optional[str]:
+        """Retorna deployment_name se disponível"""
+        return self.deployment_name
+```
+
+#### `domain/value_objects/cost_info.py`
+```python
+from dataclasses import dataclass
 from typing import Optional
-from uuid import UUID, uuid4
-
-from ..value_objects.loan_status import LoanStatus
-
-@dataclass
-class Loan:
-    """Entidade: Empréstimo de livro"""
-
-    id: UUID = field(default_factory=uuid4)
-    user_id: UUID = field(default_factory=uuid4)
-    book_id: UUID = field(default_factory=uuid4)
-    loan_date: datetime = field(default_factory=datetime.utcnow)
-    due_date: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(days=14))
-    return_date: Optional[datetime] = None
-    renewed_count: int = 0
-    max_renewals: int = 2
-
-    def __post_init__(self):
-        if self.due_date <= self.loan_date:
-            raise ValueError("Data de vencimento deve ser posterior à data do empréstimo")
-
-    def is_active(self) -> bool:
-        """Verifica se o empréstimo está ativo"""
-        return self.return_date is None
-
-    def is_overdue(self) -> bool:
-        """Verifica se o empréstimo está vencido"""
-        return self.is_active() and datetime.utcnow() > self.due_date
-
-    def days_until_due(self) -> int:
-        """Retorna quantos dias faltam para o vencimento"""
-        if not self.is_active():
-            return 0
-        delta = self.due_date - datetime.utcnow()
-        return max(0, delta.days)
-
-    def can_renew(self) -> bool:
-        """Verifica se o empréstimo pode ser renovado"""
-        return (self.is_active() and
-                self.renewed_count < self.max_renewals and
-                not self.is_overdue())
-
-    def renew(self, additional_days: int = 14) -> None:
-        """Renova o empréstimo"""
-        if not self.can_renew():
-            raise ValueError("Empréstimo não pode ser renovado")
-
-        self.due_date += timedelta(days=additional_days)
-        self.renewed_count += 1
-
-    def return_book(self) -> None:
-        """Registra a devolução do livro"""
-        if not self.is_active():
-            raise ValueError("Empréstimo já foi finalizado")
-
-        self.return_date = datetime.utcnow()
-
-    def get_status(self) -> LoanStatus:
-        """Retorna o status atual do empréstimo"""
-        if not self.is_active():
-            return LoanStatus.RETURNED
-        elif self.is_overdue():
-            return LoanStatus.OVERDUE
-        elif self.days_until_due() <= 2:
-            return LoanStatus.DUE_SOON
-        else:
-            return LoanStatus.ACTIVE
-```
-
-#### `domain/value_objects/isbn.py`
-```python
-from dataclasses import dataclass
-import re
 
 @dataclass(frozen=True)
-class ISBN:
-    """Value Object: ISBN do livro"""
+class CostInfo:
+    """Value Object: Informações de custo do modelo"""
 
-    value: str
-
-    def __post_init__(self):
-        if not self.value:
-            raise ValueError("ISBN é obrigatório")
-
-        # Remove hífens e espaços
-        clean_isbn = re.sub(r'[-\s]', '', self.value)
-
-        if not self._is_valid_isbn(clean_isbn):
-            raise ValueError(f"ISBN inválido: {self.value}")
-
-        # Armazena versão limpa
-        object.__setattr__(self, 'value', clean_isbn)
-
-    def _is_valid_isbn(self, isbn: str) -> bool:
-        """Valida formato do ISBN"""
-        # ISBN-10 ou ISBN-13
-        if len(isbn) == 10:
-            return self._is_valid_isbn10(isbn)
-        elif len(isbn) == 13:
-            return self._is_valid_isbn13(isbn)
-        return False
-
-    def _is_valid_isbn10(self, isbn: str) -> bool:
-        """Valida ISBN-10"""
-        if not re.match(r'^\d{9}[\dX]$', isbn):
-            return False
-
-        total = 0
-        for i, char in enumerate(isbn[:-1]):
-            total += int(char) * (10 - i)
-
-        check_digit = isbn[-1]
-        if check_digit == 'X':
-            check_digit = 10
-        else:
-            check_digit = int(check_digit)
-
-        return (total + check_digit) % 11 == 0
-
-    def _is_valid_isbn13(self, isbn: str) -> bool:
-        """Valida ISBN-13"""
-        if not re.match(r'^\d{13}$', isbn):
-            return False
-
-        total = 0
-        for i, char in enumerate(isbn[:-1]):
-            multiplier = 1 if i % 2 == 0 else 3
-            total += int(char) * multiplier
-
-        check_digit = int(isbn[-1])
-        return (total + check_digit) % 10 == 0
-
-    def formatted(self) -> str:
-        """Retorna ISBN formatado"""
-        if len(self.value) == 10:
-            return f"{self.value[:1]}-{self.value[1:6]}-{self.value[6:9]}-{self.value[9:]}"
-        else:
-            return f"{self.value[:3]}-{self.value[3:4]}-{self.value[4:6]}-{self.value[6:12]}-{self.value[12:]}"
-```
-
-#### `domain/value_objects/email.py`
-```python
-from dataclasses import dataclass
-import re
-
-@dataclass(frozen=True)
-class Email:
-    """Value Object: Email do usuário"""
-
-    value: str
+    currency: str
+    cost_input_1Mtokens: float
+    cost_output_1Mtokens: float
 
     def __post_init__(self):
-        if not self.value:
-            raise ValueError("Email é obrigatório")
+        if not self.currency:
+            raise ValueError("Moeda é obrigatória")
+        if self.cost_input_1Mtokens < 0:
+            raise ValueError("Custo de entrada não pode ser negativo")
+        if self.cost_output_1Mtokens < 0:
+            raise ValueError("Custo de saída não pode ser negativo")
 
-        if not self._is_valid_email(self.value):
-            raise ValueError(f"Email inválido: {self.value}")
+        # Validação de moeda
+        valid_currencies = {"USD", "EUR", "BRL", "GBP"}
+        if self.currency not in valid_currencies:
+            raise ValueError(f"Moeda inválida: {self.currency}. Suportadas: {valid_currencies}")
 
-    def _is_valid_email(self, email: str) -> bool:
-        """Valida formato do email"""
-        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return re.match(pattern, email) is not None
+    def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Calcula custo total baseado nos tokens"""
+        input_cost = (input_tokens / 1_000_000) * self.cost_input_1Mtokens
+        output_cost = (output_tokens / 1_000_000) * self.cost_output_1Mtokens
+        return input_cost + output_cost
 
-    def domain(self) -> str:
-        """Retorna o domínio do email"""
-        return self.value.split('@')[1]
+    def get_input_cost_per_token(self) -> float:
+        """Retorna custo por token de entrada"""
+        return self.cost_input_1Mtokens / 1_000_000
 
-    def local_part(self) -> str:
-        """Retorna a parte local do email"""
-        return self.value.split('@')[0]
+    def get_output_cost_per_token(self) -> float:
+        """Retorna custo por token de saída"""
+        return self.cost_output_1Mtokens / 1_000_000
+
+    def to_dict(self) -> dict:
+        """Converte para dicionário"""
+        return {
+            "currency": self.currency,
+            "cost_input_1Mtokens": self.cost_input_1Mtokens,
+            "cost_output_1Mtokens": self.cost_output_1Mtokens
+        }
 ```
 
 #### `domain/value_objects/enums.py`
 ```python
 from enum import Enum
 
-class BookStatus(Enum):
-    """Status de disponibilidade do livro"""
-    AVAILABLE = "available"
-    PARTIALLY_AVAILABLE = "partially_available"
-    UNAVAILABLE = "unavailable"
+class ModelStatus(Enum):
+    """Status do modelo LLM"""
+    PUBLIC = "public"
+    PRIVATE = "private"
+    PRIVATE_NO_PROJECTS = "private_no_projects"
+    INACTIVE = "inactive"
 
-class LoanStatus(Enum):
-    """Status do empréstimo"""
-    ACTIVE = "active"
-    DUE_SOON = "due_soon"
-    OVERDUE = "overdue"
-    RETURNED = "returned"
+class ProviderType(Enum):
+    """Tipos de provedor"""
+    AZURE = "Azure"
+    OPENAI = "OpenAI"
+    ANTHROPIC = "Anthropic"
+    GOOGLE = "Google"
+    AWS = "AWS"
+    HUGGING_FACE = "HuggingFace"
+    COHERE = "Cohere"
+    TOGETHER = "Together"
 
-class NotificationType(Enum):
-    """Tipos de notificação"""
-    DUE_REMINDER = "due_reminder"
-    OVERDUE_NOTICE = "overdue_notice"
-    RETURN_CONFIRMATION = "return_confirmation"
-    RENEWAL_CONFIRMATION = "renewal_confirmation"
+class ModelType(Enum):
+    """Tipos de modelo"""
+    AZURE_OPENAI = "AzureOpenAI"
+    OPENAI = "OpenAI"
+    ANTHROPIC_VERTEX = "AnthropicVertex"
+    ANTHROPIC = "Anthropic"
+    VERTEX_AI = "VertexAI"
+    BEDROCK = "Bedrock"
+    HUGGING_FACE = "HuggingFace"
+    COHERE = "Cohere"
+    TOGETHER_AI = "TogetherAI"
+
+class OperationType(Enum):
+    """Tipos de operação suportadas"""
+    CHAT_COMPLETION = "ChatCompletion"
+    COMPLETION = "Completion"
+    EMBEDDINGS = "Embeddings"
+    IMAGE_GENERATION = "ImageGeneration"
+    SPEECH_TO_TEXT = "SpeechToText"
+    TEXT_TO_SPEECH = "TextToSpeech"
+    MODERATION = "Moderation"
+    RESPONSES = "Responses"
 ```
 
-#### `domain/services/loan_service.py`
+#### `domain/services/model_validation_service.py`
 ```python
-from datetime import datetime, timedelta
-from typing import List
-from uuid import UUID
+from typing import List, Dict, Any
+from ..entities.llm_model import LLMModel
+from ..value_objects.enums import ProviderType, ModelType, OperationType
 
-from ..entities.loan import Loan
-from ..entities.user import User
-from ..entities.book import Book
-from ..repositories.loan_repository import LoanRepositoryPort
+class ModelValidationService:
+    """Serviço de domínio para validação de modelos"""
 
-class LoanDomainService:
-    """Serviço de domínio para regras complexas de empréstimo"""
+    PROVIDER_MODEL_TYPE_MAPPING = {
+        ProviderType.AZURE.value: [ModelType.AZURE_OPENAI.value],
+        ProviderType.OPENAI.value: [ModelType.OPENAI.value],
+        ProviderType.ANTHROPIC.value: [ModelType.ANTHROPIC.value, ModelType.ANTHROPIC_VERTEX.value],
+        ProviderType.GOOGLE.value: [ModelType.VERTEX_AI.value],
+        ProviderType.AWS.value: [ModelType.BEDROCK.value],
+        ProviderType.HUGGING_FACE.value: [ModelType.HUGGING_FACE.value],
+        ProviderType.COHERE.value: [ModelType.COHERE.value],
+        ProviderType.TOGETHER.value: [ModelType.TOGETHER_AI.value]
+    }
 
-    def __init__(self, loan_repository: LoanRepositoryPort):
-        self._loan_repository = loan_repository
+    REQUIRED_PARAMETERS_BY_TYPE = {
+        ModelType.AZURE_OPENAI.value: ["deployment_name", "api_version", "endpoint"],
+        ModelType.OPENAI.value: [],
+        ModelType.ANTHROPIC.value: [],
+        ModelType.VERTEX_AI.value: ["project_id", "location"],
+        ModelType.BEDROCK.value: ["region"]
+    }
 
-    def can_user_borrow_book(self, user: User, book: Book) -> tuple[bool, str]:
-        """Verifica se usuário pode emprestar o livro"""
-        # Verifica se o livro está disponível
-        if not book.is_available():
-            return False, f"Livro '{book.title}' não possui cópias disponíveis"
+    @classmethod
+    def validate_provider_model_type_compatibility(cls, provider: str, model_type: str) -> bool:
+        """Valida se o tipo de modelo é compatível com o provedor"""
+        allowed_types = cls.PROVIDER_MODEL_TYPE_MAPPING.get(provider, [])
+        return model_type in allowed_types
 
-        # Conta empréstimos ativos do usuário
-        active_loans = self._loan_repository.count_active_loans_by_user(user.id)
+    @classmethod
+    def validate_required_parameters(cls, model_type: str, parameters: Dict[str, Any]) -> List[str]:
+        """Valida parâmetros obrigatórios e retorna lista de erros"""
+        required_params = cls.REQUIRED_PARAMETERS_BY_TYPE.get(model_type, [])
+        missing_params = []
 
-        # Verifica limite de empréstimos
-        if not user.can_borrow_more_books(active_loans):
-            return False, f"Usuário já possui {active_loans} livros emprestados (limite: {user.max_borrowed_books})"
+        for param in required_params:
+            if param not in parameters or not parameters[param]:
+                missing_params.append(param)
 
-        # Verifica se usuário já tem este livro emprestado
-        has_same_book = self._loan_repository.user_has_active_loan_for_book(user.id, book.id)
-        if has_same_book:
-            return False, f"Usuário já possui o livro '{book.title}' emprestado"
+        return missing_params
 
-        return True, "Empréstimo permitido"
+    @classmethod
+    def validate_operations(cls, operations: List[str]) -> List[str]:
+        """Valida operações suportadas"""
+        valid_operations = [op.value for op in OperationType]
+        invalid_operations = [op for op in operations if op not in valid_operations]
+        return invalid_operations
 
-    def create_loan(self, user: User, book: Book) -> Loan:
-        """Cria um novo empréstimo"""
-        can_borrow, message = self.can_user_borrow_book(user, book)
+    @classmethod
+    def validate_model(cls, model: LLMModel) -> List[str]:
+        """Validação completa do modelo"""
+        errors = []
 
-        if not can_borrow:
-            raise ValueError(message)
+        # Valida compatibilidade provedor-tipo
+        if not cls.validate_provider_model_type_compatibility(model.provider, model.model_type):
+            errors.append(f"Tipo de modelo '{model.model_type}' não é compatível com provedor '{model.provider}'")
 
-        # Cria o empréstimo
-        loan = Loan(
-            user_id=user.id,
-            book_id=book.id
-        )
+        # Valida parâmetros obrigatórios
+        missing_params = cls.validate_required_parameters(model.model_type, model.parameters.to_dict())
+        if missing_params:
+            errors.append(f"Parâmetros obrigatórios ausentes: {', '.join(missing_params)}")
 
-        # Atualiza disponibilidade do livro
-        book.borrow_copy()
+        # Valida operações
+        invalid_ops = cls.validate_operations(model.operations)
+        if invalid_ops:
+            errors.append(f"Operações inválidas: {', '.join(invalid_ops)}")
 
-        return loan
+        return errors
+```
 
-    def return_loan(self, loan: Loan, book: Book) -> None:
-        """Processa devolução de empréstimo"""
-        if not loan.is_active():
-            raise ValueError("Empréstimo já foi finalizado")
+#### `domain/repositories/model_repository.py`
+```python
+from abc import ABC, abstractmethod
+from typing import List, Optional
+from ..entities.llm_model import LLMModel
 
-        loan.return_book()
-        book.return_copy()
+class ModelRepositoryPort(ABC):
+    """Port para repositório de modelos LLM"""
 
-    def get_loans_due_soon(self, days_ahead: int = 2) -> List[Loan]:
-        """Retorna empréstimos que vencem em X dias"""
-        return self._loan_repository.find_loans_due_in_days(days_ahead)
+    @abstractmethod
+    async def save(self, model: LLMModel) -> LLMModel:
+        """Salva ou atualiza um modelo"""
+        pass
 
-    def get_overdue_loans(self) -> List[Loan]:
-        """Retorna empréstimos vencidos"""
-        return self._loan_repository.find_overdue_loans()
+    @abstractmethod
+    async def find_by_id(self, model_id: str) -> Optional[LLMModel]:
+        """Busca modelo por ID"""
+        pass
+
+    @abstractmethod
+    async def find_by_name(self, name: str) -> Optional[LLMModel]:
+        """Busca modelo por nome"""
+        pass
+
+    @abstractmethod
+    async def find_by_deployment_name(self, deployment_name: str) -> Optional[LLMModel]:
+        """Busca modelo por deployment_name"""
+        pass
+
+    @abstractmethod
+    async def find_by_provider(self, provider: str) -> List[LLMModel]:
+        """Lista modelos por provedor"""
+        pass
+
+    @abstractmethod
+    async def find_by_model_type(self, model_type: str) -> List[LLMModel]:
+        """Lista modelos por tipo"""
+        pass
+
+    @abstractmethod
+    async def find_by_operation(self, operation: str) -> List[LLMModel]:
+        """Lista modelos que suportam uma operação"""
+        pass
+
+    @abstractmethod
+    async def find_by_project(self, project_id: str) -> List[LLMModel]:
+        """Lista modelos acessíveis por um projeto"""
+        pass
+
+    @abstractmethod
+    async def find_all(self, include_inactive: bool = False) -> List[LLMModel]:
+        """Lista todos os modelos"""
+        pass
+
+    @abstractmethod
+    async def delete(self, model_id: str) -> bool:
+        """Remove um modelo"""
+        pass
+
+    @abstractmethod
+    async def exists_by_id(self, model_id: str) -> bool:
+        """Verifica se modelo existe por ID"""
+        pass
 ```
 
 ### 2. Camada de Aplicação (Use Cases)
@@ -438,985 +466,618 @@ class LoanDomainService:
 ```python
 from abc import ABC, abstractmethod
 from typing import List, Optional
-from uuid import UUID
 
-from domain.entities.book import Book
-from domain.entities.user import User
-from domain.entities.loan import Loan
+from domain.entities.llm_model import LLMModel
+from domain.repositories.model_repository import ModelRepositoryPort
 
-class BookRepositoryPort(ABC):
-    """Port para repositório de livros"""
-
-    @abstractmethod
-    async def save(self, book: Book) -> Book:
-        pass
-
-    @abstractmethod
-    async def find_by_id(self, book_id: UUID) -> Optional[Book]:
-        pass
-
-    @abstractmethod
-    async def find_by_isbn(self, isbn: str) -> Optional[Book]:
-        pass
-
-    @abstractmethod
-    async def find_by_title(self, title: str) -> List[Book]:
-        pass
-
-    @abstractmethod
-    async def find_all(self, limit: int = 100, offset: int = 0) -> List[Book]:
-        pass
-
-    @abstractmethod
-    async def delete(self, book_id: UUID) -> bool:
-        pass
-
-class UserRepositoryPort(ABC):
-    """Port para repositório de usuários"""
-
-    @abstractmethod
-    async def save(self, user: User) -> User:
-        pass
-
-    @abstractmethod
-    async def find_by_id(self, user_id: UUID) -> Optional[User]:
-        pass
-
-    @abstractmethod
-    async def find_by_email(self, email: str) -> Optional[User]:
-        pass
-
-    @abstractmethod
-    async def find_all(self, limit: int = 100, offset: int = 0) -> List[User]:
-        pass
-
-class LoanRepositoryPort(ABC):
-    """Port para repositório de empréstimos"""
-
-    @abstractmethod
-    async def save(self, loan: Loan) -> Loan:
-        pass
-
-    @abstractmethod
-    async def find_by_id(self, loan_id: UUID) -> Optional[Loan]:
-        pass
-
-    @abstractmethod
-    async def find_by_user_id(self, user_id: UUID) -> List[Loan]:
-        pass
-
-    @abstractmethod
-    async def find_active_by_user_id(self, user_id: UUID) -> List[Loan]:
-        pass
-
-    @abstractmethod
-    async def count_active_loans_by_user(self, user_id: UUID) -> int:
-        pass
-
-    @abstractmethod
-    async def user_has_active_loan_for_book(self, user_id: UUID, book_id: UUID) -> bool:
-        pass
-
-    @abstractmethod
-    async def find_loans_due_in_days(self, days: int) -> List[Loan]:
-        pass
-
-    @abstractmethod
-    async def find_overdue_loans(self) -> List[Loan]:
-        pass
+# Re-exporta a interface do domínio para a camada de aplicação
+class ModelRepositoryPort(ModelRepositoryPort):
+    """Port para repositório de modelos na camada de aplicação"""
+    pass
 ```
 
-#### `application/ports/notifications.py`
+#### `application/use_cases/model_management.py`
 ```python
-from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import List, Optional, Dict, Any
+from datetime import datetime
 
-from domain.value_objects.enums import NotificationType
+from domain.entities.llm_model import LLMModel
+from domain.value_objects.model_parameters import ModelParameters
+from domain.value_objects.cost_info import CostInfo
+from domain.services.model_validation_service import ModelValidationService
+from ..ports.repositories import ModelRepositoryPort
 
-class NotificationPort(ABC):
-    """Port para serviço de notificações"""
+class CreateModelUseCase:
+    """Caso de uso: Criar modelo LLM"""
 
-    @abstractmethod
-    async def send_notification(
-        self,
-        recipient_email: str,
-        notification_type: NotificationType,
-        context: Dict[str, Any]
-    ) -> bool:
-        pass
-
-class EmailServicePort(ABC):
-    """Port para serviço de email"""
-
-    @abstractmethod
-    async def send_email(
-        self,
-        to: str,
-        subject: str,
-        body: str,
-        html_body: str = None
-    ) -> bool:
-        pass
-```
-
-#### `application/use_cases/book_management.py`
-```python
-from typing import List, Optional
-from uuid import UUID
-
-from domain.entities.book import Book
-from domain.value_objects.isbn import ISBN
-from ..ports.repositories import BookRepositoryPort
-
-class CreateBookUseCase:
-    """Caso de uso: Criar livro"""
-
-    def __init__(self, book_repository: BookRepositoryPort):
-        self._book_repository = book_repository
+    def __init__(self, model_repository: ModelRepositoryPort):
+        self._model_repository = model_repository
+        self._validation_service = ModelValidationService()
 
     async def execute(
         self,
-        title: str,
-        author: str,
-        isbn: str,
-        total_copies: int
-    ) -> Book:
-        """Executa a criação de um livro"""
+        id: str,
+        name: str,
+        code: str,
+        provider: str,
+        model_type: str,
+        parameters: Dict[str, Any],
+        costs: Dict[str, Any],
+        operations: List[str],
+        projects: List[str] = None,
+        private: bool = False
+    ) -> LLMModel:
+        """Executa a criação de um modelo"""
 
-        # Verifica se já existe livro com o mesmo ISBN
-        existing_book = await self._book_repository.find_by_isbn(isbn)
-        if existing_book:
-            raise ValueError(f"Já existe um livro com ISBN {isbn}")
+        # Verifica se já existe modelo com o mesmo ID
+        if await self._model_repository.exists_by_id(id):
+            raise ValueError(f"Já existe um modelo com ID {id}")
 
-        # Cria o livro
-        book = Book(
-            title=title,
-            author=author,
-            isbn=ISBN(isbn),
-            total_copies=total_copies,
-            available_copies=total_copies
+        # Cria objetos de valor
+        model_params = ModelParameters.from_dict(parameters)
+        cost_info = CostInfo(
+            currency=costs.get("currency", "USD"),
+            cost_input_1Mtokens=costs["cost_input_1Mtokens"],
+            cost_output_1Mtokens=costs["cost_output_1Mtokens"]
         )
+
+        # Cria o modelo
+        model = LLMModel(
+            id=id,
+            name=name,
+            code=code,
+            provider=provider,
+            model_type=model_type,
+            parameters=model_params,
+            costs=cost_info,
+            operations=operations,
+            projects=projects or [],
+            private=private
+        )
+
+        # Valida o modelo
+        validation_errors = self._validation_service.validate_model(model)
+        if validation_errors:
+            raise ValueError(f"Erros de validação: {'; '.join(validation_errors)}")
 
         # Salva no repositório
-        return await self._book_repository.save(book)
+        return await self._model_repository.save(model)
 
-class FindBookUseCase:
-    """Caso de uso: Buscar livros"""
+class FindModelUseCase:
+    """Caso de uso: Buscar modelos"""
 
-    def __init__(self, book_repository: BookRepositoryPort):
-        self._book_repository = book_repository
+    def __init__(self, model_repository: ModelRepositoryPort):
+        self._model_repository = model_repository
 
-    async def execute_by_id(self, book_id: UUID) -> Optional[Book]:
-        """Busca livro por ID"""
-        return await self._book_repository.find_by_id(book_id)
+    async def execute_by_id(self, model_id: str) -> Optional[LLMModel]:
+        """Busca modelo por ID"""
+        return await self._model_repository.find_by_id(model_id)
 
-    async def execute_by_title(self, title: str) -> List[Book]:
-        """Busca livros por título"""
-        return await self._book_repository.find_by_title(title)
+    async def execute_by_name(self, name: str) -> Optional[LLMModel]:
+        """Busca modelo por nome"""
+        return await self._model_repository.find_by_name(name)
 
-    async def execute_by_isbn(self, isbn: str) -> Optional[Book]:
-        """Busca livro por ISBN"""
-        return await self._book_repository.find_by_isbn(isbn)
+    async def execute_by_deployment_name(self, deployment_name: str) -> Optional[LLMModel]:
+        """Busca modelo por deployment_name"""
+        return await self._model_repository.find_by_deployment_name(deployment_name)
 
-class UpdateBookCopiesUseCase:
-    """Caso de uso: Atualizar cópias do livro"""
+    async def execute_by_provider(self, provider: str) -> List[LLMModel]:
+        """Lista modelos por provedor"""
+        return await self._model_repository.find_by_provider(provider)
 
-    def __init__(self, book_repository: BookRepositoryPort):
-        self._book_repository = book_repository
+    async def execute_by_model_type(self, model_type: str) -> List[LLMModel]:
+        """Lista modelos por tipo"""
+        return await self._model_repository.find_by_model_type(model_type)
 
-    async def execute(self, book_id: UUID, additional_copies: int) -> Book:
-        """Adiciona cópias ao acervo"""
+    async def execute_by_operation(self, operation: str) -> List[LLMModel]:
+        """Lista modelos que suportam uma operação"""
+        return await self._model_repository.find_by_operation(operation)
 
-        book = await self._book_repository.find_by_id(book_id)
-        if not book:
-            raise ValueError(f"Livro com ID {book_id} não encontrado")
+    async def execute_by_project(self, project_id: str) -> List[LLMModel]:
+        """Lista modelos acessíveis por projeto"""
+        return await self._model_repository.find_by_project(project_id)
 
-        book.add_copies(additional_copies)
+    async def execute_all(self, include_inactive: bool = False) -> List[LLMModel]:
+        """Lista todos os modelos"""
+        return await self._model_repository.find_all(include_inactive)
 
-        return await self._book_repository.save(book)
-```
+class UpdateModelUseCase:
+    """Caso de uso: Atualizar modelo"""
 
-#### `application/use_cases/loan_management.py`
-```python
-from typing import List
-from uuid import UUID
+    def __init__(self, model_repository: ModelRepositoryPort):
+        self._model_repository = model_repository
+        self._validation_service = ModelValidationService()
 
-from domain.entities.loan import Loan
-from domain.services.loan_service import LoanDomainService
-from ..ports.repositories import BookRepositoryPort, UserRepositoryPort, LoanRepositoryPort
-from ..ports.notifications import NotificationPort
-from domain.value_objects.enums import NotificationType
-
-class BorrowBookUseCase:
-    """Caso de uso: Emprestar livro"""
-
-    def __init__(
+    async def execute(
         self,
-        book_repository: BookRepositoryPort,
-        user_repository: UserRepositoryPort,
-        loan_repository: LoanRepositoryPort,
-        notification_service: NotificationPort
-    ):
-        self._book_repository = book_repository
-        self._user_repository = user_repository
-        self._loan_repository = loan_repository
-        self._notification_service = notification_service
-        self._loan_service = LoanDomainService(loan_repository)
+        model_id: str,
+        name: Optional[str] = None,
+        parameters: Optional[Dict[str, Any]] = None,
+        costs: Optional[Dict[str, Any]] = None,
+        operations: Optional[List[str]] = None,
+        projects: Optional[List[str]] = None,
+        private: Optional[bool] = None,
+        active: Optional[bool] = None
+    ) -> LLMModel:
+        """Atualiza um modelo existente"""
 
-    async def execute(self, user_id: UUID, book_id: UUID) -> Loan:
-        """Executa o empréstimo de um livro"""
+        model = await self._model_repository.find_by_id(model_id)
+        if not model:
+            raise ValueError(f"Modelo com ID {model_id} não encontrado")
 
-        # Busca usuário e livro
-        user = await self._user_repository.find_by_id(user_id)
-        if not user:
-            raise ValueError(f"Usuário com ID {user_id} não encontrado")
+        # Atualiza campos se fornecidos
+        if name is not None:
+            model.name = name
+        if parameters is not None:
+            model.update_parameters(parameters)
+        if costs is not None:
+            model.update_costs(
+                input_cost=costs["cost_input_1Mtokens"],
+                output_cost=costs["cost_output_1Mtokens"],
+                currency=costs.get("currency", model.costs.currency)
+            )
+        if operations is not None:
+            model.operations = operations
+        if projects is not None:
+            model.projects = projects
+        if private is not None:
+            model.private = private
+        if active is not None:
+            if active:
+                model.activate()
+            else:
+                model.deactivate()
 
-        book = await self._book_repository.find_by_id(book_id)
-        if not book:
-            raise ValueError(f"Livro com ID {book_id} não encontrado")
+        # Valida o modelo atualizado
+        validation_errors = self._validation_service.validate_model(model)
+        if validation_errors:
+            raise ValueError(f"Erros de validação: {'; '.join(validation_errors)}")
 
-        # Cria o empréstimo usando o serviço de domínio
-        loan = self._loan_service.create_loan(user, book)
+        return await self._model_repository.save(model)
 
-        # Salva o empréstimo e atualiza o livro
-        saved_loan = await self._loan_repository.save(loan)
-        await self._book_repository.save(book)
+class DeleteModelUseCase:
+    """Caso de uso: Deletar modelo"""
 
-        # Envia notificação
-        await self._notification_service.send_notification(
-            recipient_email=user.email.value,
-            notification_type=NotificationType.RETURN_CONFIRMATION,
-            context={
-                "user_name": user.name,
-                "book_title": book.title,
-                "due_date": loan.due_date.strftime("%d/%m/%Y")
-            }
-        )
+    def __init__(self, model_repository: ModelRepositoryPort):
+        self._model_repository = model_repository
 
-        return saved_loan
+    async def execute(self, model_id: str) -> bool:
+        """Deleta um modelo"""
+        if not await self._model_repository.exists_by_id(model_id):
+            raise ValueError(f"Modelo com ID {model_id} não encontrado")
 
-class ReturnBookUseCase:
-    """Caso de uso: Devolver livro"""
-
-    def __init__(
-        self,
-        book_repository: BookRepositoryPort,
-        loan_repository: LoanRepositoryPort,
-        notification_service: NotificationPort
-    ):
-        self._book_repository = book_repository
-        self._loan_repository = loan_repository
-        self._notification_service = notification_service
-        self._loan_service = LoanDomainService(loan_repository)
-
-    async def execute(self, loan_id: UUID) -> Loan:
-        """Executa a devolução de um livro"""
-
-        # Busca o empréstimo
-        loan = await self._loan_repository.find_by_id(loan_id)
-        if not loan:
-            raise ValueError(f"Empréstimo com ID {loan_id} não encontrado")
-
-        # Busca o livro
-        book = await self._book_repository.find_by_id(loan.book_id)
-        if not book:
-            raise ValueError(f"Livro com ID {loan.book_id} não encontrado")
-
-        # Processa a devolução usando o serviço de domínio
-        self._loan_service.return_loan(loan, book)
-
-        # Salva as alterações
-        updated_loan = await self._loan_repository.save(loan)
-        await self._book_repository.save(book)
-
-        return updated_loan
-
-class RenewLoanUseCase:
-    """Caso de uso: Renovar empréstimo"""
-
-    def __init__(
-        self,
-        loan_repository: LoanRepositoryPort,
-        notification_service: NotificationPort
-    ):
-        self._loan_repository = loan_repository
-        self._notification_service = notification_service
-
-    async def execute(self, loan_id: UUID) -> Loan:
-        """Executa a renovação de um empréstimo"""
-
-        loan = await self._loan_repository.find_by_id(loan_id)
-        if not loan:
-            raise ValueError(f"Empréstimo com ID {loan_id} não encontrado")
-
-        loan.renew()
-
-        return await self._loan_repository.save(loan)
-
-class NotifyDueLoansUseCase:
-    """Caso de uso: Notificar empréstimos vencendo"""
-
-    def __init__(
-        self,
-        loan_repository: LoanRepositoryPort,
-        user_repository: UserRepositoryPort,
-        book_repository: BookRepositoryPort,
-        notification_service: NotificationPort
-    ):
-        self._loan_repository = loan_repository
-        self._user_repository = user_repository
-        self._book_repository = book_repository
-        self._notification_service = notification_service
-        self._loan_service = LoanDomainService(loan_repository)
-
-    async def execute(self) -> int:
-        """Notifica usuários sobre empréstimos vencendo"""
-
-        due_loans = self._loan_service.get_loans_due_soon()
-        notifications_sent = 0
-
-        for loan in due_loans:
-            user = await self._user_repository.find_by_id(loan.user_id)
-            book = await self._book_repository.find_by_id(loan.book_id)
-
-            if user and book:
-                success = await self._notification_service.send_notification(
-                    recipient_email=user.email.value,
-                    notification_type=NotificationType.DUE_REMINDER,
-                    context={
-                        "user_name": user.name,
-                        "book_title": book.title,
-                        "due_date": loan.due_date.strftime("%d/%m/%Y"),
-                        "days_remaining": loan.days_until_due()
-                    }
-                )
-
-                if success:
-                    notifications_sent += 1
-
-        return notifications_sent
+        return await self._model_repository.delete(model_id)
 ```
 
 ### 3. Camada de Infraestrutura (Adapters)
 
-#### `infrastructure/persistence/sqlalchemy_repositories.py`
+#### `infrastructure/persistence/cosmosdb_model_repository.py`
 ```python
-from typing import List, Optional
-from uuid import UUID
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, func
+from typing import List, Optional, Dict, Any
+from azure.cosmos import CosmosClient, PartitionKey
+from azure.cosmos.exceptions import CosmosResourceNotFoundError
 
-from domain.entities.book import Book
-from domain.entities.user import User
-from domain.entities.loan import Loan
-from application.ports.repositories import BookRepositoryPort, UserRepositoryPort, LoanRepositoryPort
-from .models import BookModel, UserModel, LoanModel
+from domain.entities.llm_model import LLMModel
+from domain.value_objects.model_parameters import ModelParameters
+from domain.value_objects.cost_info import CostInfo
+from application.ports.repositories import ModelRepositoryPort
 
-class SQLAlchemyBookRepository(BookRepositoryPort):
-    """Implementação do repositório de livros com SQLAlchemy"""
+class CosmosDBModelRepository(ModelRepositoryPort):
+    """Implementação do repositório de modelos com CosmosDB"""
 
-    def __init__(self, session: Session):
-        self._session = session
+    def __init__(self, cosmos_client: CosmosClient, database_name: str, container_name: str):
+        self._client = cosmos_client
+        self._database = cosmos_client.get_database_client(database_name)
+        self._container = self._database.get_container_client(container_name)
 
-    async def save(self, book: Book) -> Book:
-        """Salva um livro no banco"""
-        book_model = self._session.query(BookModel).filter_by(id=book.id).first()
+    async def save(self, model: LLMModel) -> LLMModel:
+        """Salva um modelo no CosmosDB"""
+        document = self._to_document(model)
 
-        if book_model:
-            # Atualiza existente
-            book_model.title = book.title
-            book_model.author = book.author
-            book_model.isbn = book.isbn.value
-            book_model.total_copies = book.total_copies
-            book_model.available_copies = book.available_copies
-            book_model.updated_at = book.updated_at
+        try:
+            # Tenta atualizar se existe
+            self._container.upsert_item(document)
+        except Exception as e:
+            raise RuntimeError(f"Erro ao salvar modelo: {str(e)}")
+
+        return model
+
+    async def find_by_id(self, model_id: str) -> Optional[LLMModel]:
+        """Busca modelo por ID"""
+        try:
+            item = self._container.read_item(item=model_id, partition_key=model_id)
+            return self._to_entity(item)
+        except CosmosResourceNotFoundError:
+            return None
+
+    async def find_by_name(self, name: str) -> Optional[LLMModel]:
+        """Busca modelo por nome"""
+        query = "SELECT * FROM c WHERE c.name = @name"
+        parameters = [{"name": "@name", "value": name}]
+
+        items = list(self._container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        return self._to_entity(items[0]) if items else None
+
+    async def find_by_deployment_name(self, deployment_name: str) -> Optional[LLMModel]:
+        """Busca modelo por deployment_name"""
+        query = "SELECT * FROM c WHERE c.parameters.deployment_name = @deployment_name"
+        parameters = [{"name": "@deployment_name", "value": deployment_name}]
+
+        items = list(self._container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        return self._to_entity(items[0]) if items else None
+
+    async def find_by_provider(self, provider: str) -> List[LLMModel]:
+        """Lista modelos por provedor"""
+        query = "SELECT * FROM c WHERE c.provider = @provider AND c.active = true"
+        parameters = [{"name": "@provider", "value": provider}]
+
+        items = list(self._container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        return [self._to_entity(item) for item in items]
+
+    async def find_by_model_type(self, model_type: str) -> List[LLMModel]:
+        """Lista modelos por tipo"""
+        query = "SELECT * FROM c WHERE c.model_type = @model_type AND c.active = true"
+        parameters = [{"name": "@model_type", "value": model_type}]
+
+        items = list(self._container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        return [self._to_entity(item) for item in items]
+
+    async def find_by_operation(self, operation: str) -> List[LLMModel]:
+        """Lista modelos que suportam uma operação"""
+        query = "SELECT * FROM c WHERE ARRAY_CONTAINS(c.operations, @operation) AND c.active = true"
+        parameters = [{"name": "@operation", "value": operation}]
+
+        items = list(self._container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        return [self._to_entity(item) for item in items]
+
+    async def find_by_project(self, project_id: str) -> List[LLMModel]:
+        """Lista modelos acessíveis por um projeto"""
+        query = """SELECT * FROM c WHERE c.active = true AND
+                    (c.private = false OR ARRAY_CONTAINS(c.projects, @project_id))"""
+        parameters = [{"name": "@project_id", "value": project_id}]
+
+        items = list(self._container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        return [self._to_entity(item) for item in items]
+
+    async def find_all(self, include_inactive: bool = False) -> List[LLMModel]:
+        """Lista todos os modelos"""
+        if include_inactive:
+            query = "SELECT * FROM c"
+            parameters = []
         else:
-            # Cria novo
-            book_model = BookModel(
-                id=book.id,
-                title=book.title,
-                author=book.author,
-                isbn=book.isbn.value,
-                total_copies=book.total_copies,
-                available_copies=book.available_copies,
-                created_at=book.created_at,
-                updated_at=book.updated_at
-            )
-            self._session.add(book_model)
+            query = "SELECT * FROM c WHERE c.active = true"
+            parameters = []
 
-        self._session.commit()
-        return self._to_entity(book_model)
+        items = list(self._container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
 
-    async def find_by_id(self, book_id: UUID) -> Optional[Book]:
-        """Busca livro por ID"""
-        book_model = self._session.query(BookModel).filter_by(id=book_id).first()
-        return self._to_entity(book_model) if book_model else None
+        return [self._to_entity(item) for item in items]
 
-    async def find_by_isbn(self, isbn: str) -> Optional[Book]:
-        """Busca livro por ISBN"""
-        book_model = self._session.query(BookModel).filter_by(isbn=isbn).first()
-        return self._to_entity(book_model) if book_model else None
-
-    async def find_by_title(self, title: str) -> List[Book]:
-        """Busca livros por título (busca parcial)"""
-        book_models = self._session.query(BookModel).filter(
-            BookModel.title.ilike(f"%{title}%")
-        ).all()
-        return [self._to_entity(model) for model in book_models]
-
-    async def find_all(self, limit: int = 100, offset: int = 0) -> List[Book]:
-        """Lista todos os livros com paginação"""
-        book_models = self._session.query(BookModel).offset(offset).limit(limit).all()
-        return [self._to_entity(model) for model in book_models]
-
-    async def delete(self, book_id: UUID) -> bool:
-        """Remove um livro"""
-        book_model = self._session.query(BookModel).filter_by(id=book_id).first()
-        if book_model:
-            self._session.delete(book_model)
-            self._session.commit()
+    async def delete(self, model_id: str) -> bool:
+        """Remove um modelo"""
+        try:
+            self._container.delete_item(item=model_id, partition_key=model_id)
             return True
-        return False
+        except CosmosResourceNotFoundError:
+            return False
 
-    def _to_entity(self, model: BookModel) -> Book:
-        """Converte modelo para entidade"""
-        from domain.value_objects.isbn import ISBN
+    async def exists_by_id(self, model_id: str) -> bool:
+        """Verifica se modelo existe por ID"""
+        try:
+            self._container.read_item(item=model_id, partition_key=model_id)
+            return True
+        except CosmosResourceNotFoundError:
+            return False
 
-        return Book(
-            id=model.id,
-            title=model.title,
-            author=model.author,
-            isbn=ISBN(model.isbn),
-            total_copies=model.total_copies,
-            available_copies=model.available_copies,
-            created_at=model.created_at,
-            updated_at=model.updated_at
-        )
+    def _to_document(self, model: LLMModel) -> Dict[str, Any]:
+        """Converte entidade para documento CosmosDB"""
+        return {
+            "id": model.id,
+            "name": model.name,
+            "code": model.code,
+            "provider": model.provider,
+            "model_type": model.model_type,
+            "parameters": model.parameters.to_dict(),
+            "costs": model.costs.to_dict(),
+            "operations": model.operations,
+            "projects": model.projects,
+            "private": model.private,
+            "active": model.active,
+            "created_at": model.created_at.isoformat(),
+            "updated_at": model.updated_at.isoformat()
+        }
 
-class SQLAlchemyLoanRepository(LoanRepositoryPort):
-    """Implementação do repositório de empréstimos com SQLAlchemy"""
-
-    def __init__(self, session: Session):
-        self._session = session
-
-    async def save(self, loan: Loan) -> Loan:
-        """Salva um empréstimo no banco"""
-        loan_model = self._session.query(LoanModel).filter_by(id=loan.id).first()
-
-        if loan_model:
-            # Atualiza existente
-            loan_model.due_date = loan.due_date
-            loan_model.return_date = loan.return_date
-            loan_model.renewed_count = loan.renewed_count
-        else:
-            # Cria novo
-            loan_model = LoanModel(
-                id=loan.id,
-                user_id=loan.user_id,
-                book_id=loan.book_id,
-                loan_date=loan.loan_date,
-                due_date=loan.due_date,
-                return_date=loan.return_date,
-                renewed_count=loan.renewed_count,
-                max_renewals=loan.max_renewals
-            )
-            self._session.add(loan_model)
-
-        self._session.commit()
-        return self._to_entity(loan_model)
-
-    async def count_active_loans_by_user(self, user_id: UUID) -> int:
-        """Conta empréstimos ativos do usuário"""
-        return self._session.query(LoanModel).filter(
-            and_(
-                LoanModel.user_id == user_id,
-                LoanModel.return_date.is_(None)
-            )
-        ).count()
-
-    async def user_has_active_loan_for_book(self, user_id: UUID, book_id: UUID) -> bool:
-        """Verifica se usuário tem empréstimo ativo do livro"""
-        loan = self._session.query(LoanModel).filter(
-            and_(
-                LoanModel.user_id == user_id,
-                LoanModel.book_id == book_id,
-                LoanModel.return_date.is_(None)
-            )
-        ).first()
-        return loan is not None
-
-    async def find_loans_due_in_days(self, days: int) -> List[Loan]:
-        """Busca empréstimos que vencem em X dias"""
-        from datetime import datetime, timedelta
-
-        target_date = datetime.utcnow() + timedelta(days=days)
-        start_of_day = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_of_day = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-        loan_models = self._session.query(LoanModel).filter(
-            and_(
-                LoanModel.return_date.is_(None),
-                LoanModel.due_date >= start_of_day,
-                LoanModel.due_date <= end_of_day
-            )
-        ).all()
-
-        return [self._to_entity(model) for model in loan_models]
-
-    async def find_overdue_loans(self) -> List[Loan]:
-        """Busca empréstimos vencidos"""
+    def _to_entity(self, document: Dict[str, Any]) -> LLMModel:
+        """Converte documento para entidade"""
         from datetime import datetime
 
-        loan_models = self._session.query(LoanModel).filter(
-            and_(
-                LoanModel.return_date.is_(None),
-                LoanModel.due_date < datetime.utcnow()
-            )
-        ).all()
+        parameters = ModelParameters.from_dict(document["parameters"])
+        costs = CostInfo(**document["costs"])
 
-        return [self._to_entity(model) for model in loan_models]
-
-    def _to_entity(self, model: LoanModel) -> Loan:
-        """Converte modelo para entidade"""
-        return Loan(
-            id=model.id,
-            user_id=model.user_id,
-            book_id=model.book_id,
-            loan_date=model.loan_date,
-            due_date=model.due_date,
-            return_date=model.return_date,
-            renewed_count=model.renewed_count,
-            max_renewals=model.max_renewals
+        return LLMModel(
+            id=document["id"],
+            name=document["name"],
+            code=document["code"],
+            provider=document["provider"],
+            model_type=document["model_type"],
+            parameters=parameters,
+            costs=costs,
+            operations=document["operations"],
+            projects=document["projects"],
+            private=document["private"],
+            active=document["active"],
+            created_at=datetime.fromisoformat(document["created_at"]),
+            updated_at=datetime.fromisoformat(document["updated_at"])
         )
-```
-
-#### `infrastructure/persistence/models.py`
-```python
-from sqlalchemy import Column, String, Integer, DateTime, Boolean, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
-import uuid
-
-Base = declarative_base()
-
-class BookModel(Base):
-    """Modelo SQLAlchemy para livros"""
-    __tablename__ = "books"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    title = Column(String(255), nullable=False, index=True)
-    author = Column(String(255), nullable=False, index=True)
-    isbn = Column(String(13), nullable=False, unique=True, index=True)
-    total_copies = Column(Integer, nullable=False, default=0)
-    available_copies = Column(Integer, nullable=False, default=0)
-    created_at = Column(DateTime, nullable=False)
-    updated_at = Column(DateTime, nullable=False)
-
-    # Relacionamentos
-    loans = relationship("LoanModel", back_populates="book")
-
-class UserModel(Base):
-    """Modelo SQLAlchemy para usuários"""
-    __tablename__ = "users"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = Column(String(255), nullable=False, index=True)
-    email = Column(String(255), nullable=False, unique=True, index=True)
-    max_borrowed_books = Column(Integer, nullable=False, default=3)
-    created_at = Column(DateTime, nullable=False)
-
-    # Relacionamentos
-    loans = relationship("LoanModel", back_populates="user")
-
-class LoanModel(Base):
-    """Modelo SQLAlchemy para empréstimos"""
-    __tablename__ = "loans"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
-    book_id = Column(UUID(as_uuid=True), ForeignKey("books.id"), nullable=False, index=True)
-    loan_date = Column(DateTime, nullable=False, index=True)
-    due_date = Column(DateTime, nullable=False, index=True)
-    return_date = Column(DateTime, nullable=True, index=True)
-    renewed_count = Column(Integer, nullable=False, default=0)
-    max_renewals = Column(Integer, nullable=False, default=2)
-
-    # Relacionamentos
-    user = relationship("UserModel", back_populates="loans")
-    book = relationship("BookModel", back_populates="loans")
 ```
 
 #### `infrastructure/web/fastapi_controllers.py`
 ```python
-from fastapi import APIRouter, HTTPException, Depends, status
-from typing import List
-from uuid import UUID
+from fastapi import APIRouter, HTTPException, Depends, status, Query
+from typing import List, Optional
 
-from application.use_cases.book_management import CreateBookUseCase, FindBookUseCase, UpdateBookCopiesUseCase
-from application.use_cases.loan_management import BorrowBookUseCase, ReturnBookUseCase, RenewLoanUseCase
-from .schemas import BookCreateRequest, BookResponse, LoanResponse, BorrowBookRequest
-from .dependencies import get_book_use_cases, get_loan_use_cases
+from application.use_cases.model_management import (
+    CreateModelUseCase, FindModelUseCase, UpdateModelUseCase, DeleteModelUseCase
+)
+from .schemas import (
+    ModelCreateRequest, ModelResponse, ModelUpdateRequest
+)
+from .dependencies import get_model_use_cases
 
 router = APIRouter()
 
-# Endpoints de Livros
-@router.post("/books", response_model=BookResponse, status_code=status.HTTP_201_CREATED)
-async def create_book(
-    request: BookCreateRequest,
-    use_cases = Depends(get_book_use_cases)
+# Endpoints de Modelos
+@router.post("/models", response_model=ModelResponse, status_code=status.HTTP_201_CREATED)
+async def create_model(
+    request: ModelCreateRequest,
+    use_cases = Depends(get_model_use_cases)
 ):
-    """Cria um novo livro"""
+    """Cria um novo modelo LLM"""
     try:
-        create_use_case: CreateBookUseCase = use_cases["create"]
-        book = await create_use_case.execute(
-            title=request.title,
-            author=request.author,
-            isbn=request.isbn,
-            total_copies=request.total_copies
+        create_use_case: CreateModelUseCase = use_cases["create"]
+        model = await create_use_case.execute(
+            id=request.id,
+            name=request.name,
+            code=request.code,
+            provider=request.provider,
+            model_type=request.model_type,
+            parameters=request.parameters,
+            costs=request.costs,
+            operations=request.operations,
+            projects=request.projects,
+            private=request.private
         )
-        return BookResponse.from_entity(book)
+        return ModelResponse.from_entity(model)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.get("/books/{book_id}", response_model=BookResponse)
-async def get_book(
-    book_id: UUID,
-    use_cases = Depends(get_book_use_cases)
+@router.get("/models/{model_id}", response_model=ModelResponse)
+async def get_model(
+    model_id: str,
+    use_cases = Depends(get_model_use_cases)
 ):
-    """Busca livro por ID"""
-    find_use_case: FindBookUseCase = use_cases["find"]
-    book = await find_use_case.execute_by_id(book_id)
+    """Busca modelo por ID"""
+    find_use_case: FindModelUseCase = use_cases["find"]
+    model = await find_use_case.execute_by_id(model_id)
 
-    if not book:
-        raise HTTPException(status_code=404, detail="Livro não encontrado")
+    if not model:
+        raise HTTPException(status_code=404, detail="Modelo não encontrado")
 
-    return BookResponse.from_entity(book)
+    return ModelResponse.from_entity(model)
 
-@router.get("/books", response_model=List[BookResponse])
-async def search_books(
-    title: str = None,
-    isbn: str = None,
-    use_cases = Depends(get_book_use_cases)
+@router.get("/models", response_model=List[ModelResponse])
+async def list_models(
+    provider: Optional[str] = Query(None, description="Filtrar por provedor"),
+    model_type: Optional[str] = Query(None, description="Filtrar por tipo de modelo"),
+    operation: Optional[str] = Query(None, description="Filtrar por operação suportada"),
+    project_id: Optional[str] = Query(None, description="Filtrar por projeto"),
+    include_inactive: bool = Query(False, description="Incluir modelos inativos"),
+    use_cases = Depends(get_model_use_cases)
 ):
-    """Busca livros por título ou ISBN"""
-    find_use_case: FindBookUseCase = use_cases["find"]
+    """Lista modelos com filtros opcionais"""
+    find_use_case: FindModelUseCase = use_cases["find"]
 
-    if isbn:
-        book = await find_use_case.execute_by_isbn(isbn)
-        return [BookResponse.from_entity(book)] if book else []
-    elif title:
-        books = await find_use_case.execute_by_title(title)
-        return [BookResponse.from_entity(book) for book in books]
+    if provider:
+        models = await find_use_case.execute_by_provider(provider)
+    elif model_type:
+        models = await find_use_case.execute_by_model_type(model_type)
+    elif operation:
+        models = await find_use_case.execute_by_operation(operation)
+    elif project_id:
+        models = await find_use_case.execute_by_project(project_id)
     else:
-        raise HTTPException(status_code=400, detail="Informe título ou ISBN para busca")
+        models = await find_use_case.execute_all(include_inactive)
 
-@router.patch("/books/{book_id}/copies")
-async def add_book_copies(
-    book_id: UUID,
-    additional_copies: int,
-    use_cases = Depends(get_book_use_cases)
+    return [ModelResponse.from_entity(model) for model in models]
+
+@router.get("/models/by-name/{name}", response_model=ModelResponse)
+async def get_model_by_name(
+    name: str,
+    use_cases = Depends(get_model_use_cases)
 ):
-    """Adiciona cópias ao acervo"""
+    """Busca modelo por nome"""
+    find_use_case: FindModelUseCase = use_cases["find"]
+    model = await find_use_case.execute_by_name(name)
+
+    if not model:
+        raise HTTPException(status_code=404, detail="Modelo não encontrado")
+
+    return ModelResponse.from_entity(model)
+
+@router.get("/models/by-deployment/{deployment_name}", response_model=ModelResponse)
+async def get_model_by_deployment(
+    deployment_name: str,
+    use_cases = Depends(get_model_use_cases)
+):
+    """Busca modelo por deployment_name"""
+    find_use_case: FindModelUseCase = use_cases["find"]
+    model = await find_use_case.execute_by_deployment_name(deployment_name)
+
+    if not model:
+        raise HTTPException(status_code=404, detail="Modelo não encontrado")
+
+    return ModelResponse.from_entity(model)
+
+@router.patch("/models/{model_id}", response_model=ModelResponse)
+async def update_model(
+    model_id: str,
+    request: ModelUpdateRequest,
+    use_cases = Depends(get_model_use_cases)
+):
+    """Atualiza um modelo existente"""
     try:
-        update_use_case: UpdateBookCopiesUseCase = use_cases["update_copies"]
-        book = await update_use_case.execute(book_id, additional_copies)
-        return BookResponse.from_entity(book)
+        update_use_case: UpdateModelUseCase = use_cases["update"]
+        model = await update_use_case.execute(
+            model_id=model_id,
+            name=request.name,
+            parameters=request.parameters,
+            costs=request.costs,
+            operations=request.operations,
+            projects=request.projects,
+            private=request.private,
+            active=request.active
+        )
+        return ModelResponse.from_entity(model)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# Endpoints de Empréstimos
-@router.post("/loans", response_model=LoanResponse, status_code=status.HTTP_201_CREATED)
-async def borrow_book(
-    request: BorrowBookRequest,
-    use_cases = Depends(get_loan_use_cases)
+@router.delete("/models/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_model(
+    model_id: str,
+    use_cases = Depends(get_model_use_cases)
 ):
-    """Empresta um livro"""
+    """Deleta um modelo"""
     try:
-        borrow_use_case: BorrowBookUseCase = use_cases["borrow"]
-        loan = await borrow_use_case.execute(request.user_id, request.book_id)
-        return LoanResponse.from_entity(loan)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@router.patch("/loans/{loan_id}/return")
-async def return_book(
-    loan_id: UUID,
-    use_cases = Depends(get_loan_use_cases)
-):
-    """Devolve um livro"""
-    try:
-        return_use_case: ReturnBookUseCase = use_cases["return"]
-        loan = await return_use_case.execute(loan_id)
-        return LoanResponse.from_entity(loan)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@router.patch("/loans/{loan_id}/renew")
-async def renew_loan(
-    loan_id: UUID,
-    use_cases = Depends(get_loan_use_cases)
-):
-    """Renova um empréstimo"""
-    try:
-        renew_use_case: RenewLoanUseCase = use_cases["renew"]
-        loan = await renew_use_case.execute(loan_id)
-        return LoanResponse.from_entity(loan)
+        delete_use_case: DeleteModelUseCase = use_cases["delete"]
+        success = await delete_use_case.execute(model_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Modelo não encontrado")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 ```
 
 #### `infrastructure/web/schemas.py`
 ```python
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional
-from uuid import UUID
+from typing import Optional, List, Dict, Any
 
-from domain.entities.book import Book
-from domain.entities.loan import Loan
-from domain.entities.user import User
+from domain.entities.llm_model import LLMModel
 
-class BookCreateRequest(BaseModel):
-    """Schema para criação de livro"""
-    title: str = Field(..., min_length=1, max_length=255)
-    author: str = Field(..., min_length=1, max_length=255)
-    isbn: str = Field(..., min_length=10, max_length=13)
-    total_copies: int = Field(..., ge=1)
+class ModelCreateRequest(BaseModel):
+    """Schema para criação de modelo"""
+    id: str = Field(..., min_length=1, max_length=100)
+    name: str = Field(..., min_length=1, max_length=255)
+    code: str = Field(..., min_length=1, max_length=100)
+    provider: str = Field(..., min_length=1, max_length=50)
+    model_type: str = Field(..., min_length=1, max_length=50)
+    parameters: Dict[str, Any] = Field(...)
+    costs: Dict[str, Any] = Field(...)
+    operations: List[str] = Field(..., min_items=1)
+    projects: List[str] = Field(default_factory=list)
+    private: bool = Field(default=False)
 
-class BookResponse(BaseModel):
-    """Schema de resposta para livro"""
-    id: UUID
-    title: str
-    author: str
-    isbn: str
-    total_copies: int
-    available_copies: int
+class ModelUpdateRequest(BaseModel):
+    """Schema para atualização de modelo"""
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    parameters: Optional[Dict[str, Any]] = None
+    costs: Optional[Dict[str, Any]] = None
+    operations: Optional[List[str]] = None
+    projects: Optional[List[str]] = None
+    private: Optional[bool] = None
+    active: Optional[bool] = None
+
+class ModelResponse(BaseModel):
+    """Schema de resposta para modelo"""
+    id: str
+    name: str
+    code: str
+    provider: str
+    model_type: str
+    parameters: Dict[str, Any]
+    costs: Dict[str, Any]
+    operations: List[str]
+    projects: List[str]
+    private: bool
+    active: bool
     status: str
     created_at: datetime
     updated_at: datetime
 
     @classmethod
-    def from_entity(cls, book: Book) -> "BookResponse":
+    def from_entity(cls, model: LLMModel) -> "ModelResponse":
         return cls(
-            id=book.id,
-            title=book.title,
-            author=book.author,
-            isbn=book.isbn.value,
-            total_copies=book.total_copies,
-            available_copies=book.available_copies,
-            status=book.get_status().value,
-            created_at=book.created_at,
-            updated_at=book.updated_at
+            id=model.id,
+            name=model.name,
+            code=model.code,
+            provider=model.provider,
+            model_type=model.model_type,
+            parameters=model.parameters.to_dict(),
+            costs=model.costs.to_dict(),
+            operations=model.operations,
+            projects=model.projects,
+            private=model.private,
+            active=model.active,
+            status=model.get_status().value,
+            created_at=model.created_at,
+            updated_at=model.updated_at
         )
 
-class UserCreateRequest(BaseModel):
-    """Schema para criação de usuário"""
-    name: str = Field(..., min_length=1, max_length=255)
-    email: EmailStr
-    max_borrowed_books: int = Field(3, ge=1, le=10)
+class ModelListResponse(BaseModel):
+    """Schema de resposta para lista de modelos"""
+    models: List[ModelResponse]
+    total: int
+    provider_filter: Optional[str] = None
+    model_type_filter: Optional[str] = None
+    operation_filter: Optional[str] = None
 
-class UserResponse(BaseModel):
-    """Schema de resposta para usuário"""
-    id: UUID
-    name: str
-    email: str
-    max_borrowed_books: int
-    created_at: datetime
+class ProviderSummary(BaseModel):
+    """Sumário por provedor"""
+    provider: str
+    model_count: int
+    model_types: List[str]
+    operations: List[str]
 
-    @classmethod
-    def from_entity(cls, user: User) -> "UserResponse":
-        return cls(
-            id=user.id,
-            name=user.name,
-            email=user.email.value,
-            max_borrowed_books=user.max_borrowed_books,
-            created_at=user.created_at
-        )
-
-class BorrowBookRequest(BaseModel):
-    """Schema para empréstimo de livro"""
-    user_id: UUID
-    book_id: UUID
-
-class LoanResponse(BaseModel):
-    """Schema de resposta para empréstimo"""
-    id: UUID
-    user_id: UUID
-    book_id: UUID
-    loan_date: datetime
-    due_date: datetime
-    return_date: Optional[datetime]
-    renewed_count: int
-    max_renewals: int
-    status: str
-    days_until_due: int
-
-    @classmethod
-    def from_entity(cls, loan: Loan) -> "LoanResponse":
-        return cls(
-            id=loan.id,
-            user_id=loan.user_id,
-            book_id=loan.book_id,
-            loan_date=loan.loan_date,
-            due_date=loan.due_date,
-            return_date=loan.return_date,
-            renewed_count=loan.renewed_count,
-            max_renewals=loan.max_renewals,
-            status=loan.get_status().value,
-            days_until_due=loan.days_until_due()
-        )
-```
-
-#### `infrastructure/notifications/email_adapter.py`
-```python
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from typing import Dict, Any
-
-from application.ports.notifications import NotificationPort, EmailServicePort
-from domain.value_objects.enums import NotificationType
-
-class SMTPEmailService(EmailServicePort):
-    """Implementação do serviço de email via SMTP"""
-
-    def __init__(self, smtp_host: str, smtp_port: int, username: str, password: str):
-        self.smtp_host = smtp_host
-        self.smtp_port = smtp_port
-        self.username = username
-        self.password = password
-
-    async def send_email(
-        self,
-        to: str,
-        subject: str,
-        body: str,
-        html_body: str = None
-    ) -> bool:
-        """Envia email via SMTP"""
-        try:
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = subject
-            msg['From'] = self.username
-            msg['To'] = to
-
-            # Adiciona corpo em texto
-            text_part = MIMEText(body, 'plain', 'utf-8')
-            msg.attach(text_part)
-
-            # Adiciona corpo em HTML se fornecido
-            if html_body:
-                html_part = MIMEText(html_body, 'html', 'utf-8')
-                msg.attach(html_part)
-
-            # Conecta e envia
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
-                server.starttls()
-                server.login(self.username, self.password)
-                server.send_message(msg)
-
-            return True
-
-        except Exception as e:
-            print(f"Erro ao enviar email: {e}")
-            return False
-
-class LibraryNotificationService(NotificationPort):
-    """Serviço de notificações da biblioteca"""
-
-    def __init__(self, email_service: EmailServicePort):
-        self._email_service = email_service
-
-    async def send_notification(
-        self,
-        recipient_email: str,
-        notification_type: NotificationType,
-        context: Dict[str, Any]
-    ) -> bool:
-        """Envia notificação baseada no tipo"""
-
-        template = self._get_template(notification_type)
-        if not template:
-            return False
-
-        subject = template["subject"].format(**context)
-        body = template["body"].format(**context)
-        html_body = template.get("html_body", "").format(**context)
-
-        return await self._email_service.send_email(
-            to=recipient_email,
-            subject=subject,
-            body=body,
-            html_body=html_body if html_body else None
-        )
-
-    def _get_template(self, notification_type: NotificationType) -> Dict[str, str]:
-        """Retorna template da notificação"""
-        templates = {
-            NotificationType.DUE_REMINDER: {
-                "subject": "Lembrete: Livro vence em {days_remaining} dias",
-                "body": """Olá {user_name},
-
-Este é um lembrete de que o livro "{book_title}" deve ser devolvido em {days_remaining} dias.
-
-Data de vencimento: {due_date}
-
-Por favor, devolva o livro na data correta para evitar multas.
-
-Biblioteca Digital""",
-                "html_body": """
-                <h2>Lembrete de Devolução</h2>
-                <p>Olá <strong>{user_name}</strong>,</p>
-                <p>Este é um lembrete de que o livro <em>"{book_title}"</em> deve ser devolvido em <strong>{days_remaining} dias</strong>.</p>
-                <p><strong>Data de vencimento:</strong> {due_date}</p>
-                <p>Por favor, devolva o livro na data correta para evitar multas.</p>
-                <hr>
-                <p><em>Biblioteca Digital</em></p>
-                """
-            },
-            NotificationType.OVERDUE_NOTICE: {
-                "subject": "URGENTE: Livro em atraso",
-                "body": """Olá {user_name},
-
-O livro "{book_title}" está em atraso desde {due_date}.
-
-Por favor, devolva o livro o mais rápido possível. Multas podem ser aplicadas.
-
-Biblioteca Digital""",
-                "html_body": """
-                <h2 style="color: red;">AVISO: Livro em Atraso</h2>
-                <p>Olá <strong>{user_name}</strong>,</p>
-                <p>O livro <em>"{book_title}"</em> está <strong style="color: red;">em atraso</strong> desde {due_date}.</p>
-                <p>Por favor, devolva o livro o mais rápido possível. Multas podem ser aplicadas.</p>
-                <hr>
-                <p><em>Biblioteca Digital</em></p>
-                """
-            },
-            NotificationType.RETURN_CONFIRMATION: {
-                "subject": "Empréstimo realizado com sucesso",
-                "body": """Olá {user_name},
-
-O empréstimo do livro "{book_title}" foi realizado com sucesso!
-
-Data de vencimento: {due_date}
-
-Aproveite a leitura!
-
-Biblioteca Digital""",
-                "html_body": """
-                <h2 style="color: green;">Empréstimo Confirmado</h2>
-                <p>Olá <strong>{user_name}</strong>,</p>
-                <p>O empréstimo do livro <em>"{book_title}"</em> foi realizado com sucesso!</p>
-                <p><strong>Data de vencimento:</strong> {due_date}</p>
-                <p>Aproveite a leitura!</p>
-                <hr>
-                <p><em>Biblioteca Digital</em></p>
-                """
-            }
-        }
-
-        return templates.get(notification_type, {})
+class OperationSummary(BaseModel):
+    """Sumário por operação"""
+    operation: str
+    model_count: int
+    providers: List[str]
+    avg_input_cost: float
+    avg_output_cost: float
 ```
 
 ### 4. Configuração e Dependency Injection
@@ -1424,80 +1085,41 @@ Biblioteca Digital""",
 #### `infrastructure/config/dependencies.py`
 ```python
 from functools import lru_cache
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from azure.cosmos import CosmosClient
+from typing import Dict, Any
 
-from application.use_cases.book_management import CreateBookUseCase, FindBookUseCase, UpdateBookCopiesUseCase
-from application.use_cases.loan_management import BorrowBookUseCase, ReturnBookUseCase, RenewLoanUseCase
-from infrastructure.persistence.sqlalchemy_repositories import SQLAlchemyBookRepository, SQLAlchemyLoanRepository, SQLAlchemyUserRepository
-from infrastructure.notifications.email_adapter import SMTPEmailService, LibraryNotificationService
+from application.use_cases.model_management import (
+    CreateModelUseCase, FindModelUseCase, UpdateModelUseCase, DeleteModelUseCase
+)
+from infrastructure.persistence.cosmosdb_model_repository import CosmosDBModelRepository
 from .settings import get_settings
 
-# Configuração do banco de dados
+# Configuração do CosmosDB
 @lru_cache()
-def get_database_engine():
+def get_cosmos_client():
     settings = get_settings()
-    engine = create_engine(settings.database_url)
-    return engine
-
-@lru_cache()
-def get_session_factory():
-    engine = get_database_engine()
-    return sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-def get_database_session() -> Session:
-    SessionLocal = get_session_factory()
-    session = SessionLocal()
-    try:
-        yield session
-    finally:
-        session.close()
-
-# Repositórios
-def get_book_repository(session: Session = Depends(get_database_session)):
-    return SQLAlchemyBookRepository(session)
-
-def get_user_repository(session: Session = Depends(get_database_session)):
-    return SQLAlchemyUserRepository(session)
-
-def get_loan_repository(session: Session = Depends(get_database_session)):
-    return SQLAlchemyLoanRepository(session)
-
-# Serviços
-@lru_cache()
-def get_email_service():
-    settings = get_settings()
-    return SMTPEmailService(
-        smtp_host=settings.smtp_host,
-        smtp_port=settings.smtp_port,
-        username=settings.smtp_username,
-        password=settings.smtp_password
+    return CosmosClient(
+        url=settings.cosmos_endpoint,
+        credential=settings.cosmos_key
     )
 
-def get_notification_service():
-    email_service = get_email_service()
-    return LibraryNotificationService(email_service)
+def get_model_repository():
+    cosmos_client = get_cosmos_client()
+    settings = get_settings()
+    return CosmosDBModelRepository(
+        cosmos_client=cosmos_client,
+        database_name=settings.cosmos_database,
+        container_name=settings.cosmos_container
+    )
 
 # Use Cases
-def get_book_use_cases(
-    book_repository = Depends(get_book_repository)
-):
+def get_model_use_cases() -> Dict[str, Any]:
+    model_repository = get_model_repository()
     return {
-        "create": CreateBookUseCase(book_repository),
-        "find": FindBookUseCase(book_repository),
-        "update_copies": UpdateBookCopiesUseCase(book_repository)
-    }
-
-def get_loan_use_cases(
-    book_repository = Depends(get_book_repository),
-    user_repository = Depends(get_user_repository),
-    loan_repository = Depends(get_loan_repository),
-    notification_service = Depends(get_notification_service)
-):
-    return {
-        "borrow": BorrowBookUseCase(book_repository, user_repository, loan_repository, notification_service),
-        "return": ReturnBookUseCase(book_repository, loan_repository, notification_service),
-        "renew": RenewLoanUseCase(loan_repository, notification_service)
+        "create": CreateModelUseCase(model_repository),
+        "find": FindModelUseCase(model_repository),
+        "update": UpdateModelUseCase(model_repository),
+        "delete": DeleteModelUseCase(model_repository)
     }
 ```
 
@@ -1509,19 +1131,24 @@ from typing import Optional
 class Settings(BaseSettings):
     """Configurações da aplicação"""
 
-    # Database
-    database_url: str = "postgresql://user:password@localhost/library_db"
-
-    # SMTP Settings
-    smtp_host: str = "localhost"
-    smtp_port: int = 587
-    smtp_username: str = ""
-    smtp_password: str = ""
+    # CosmosDB
+    cosmos_endpoint: str
+    cosmos_key: str
+    cosmos_database: str = "llm_models"
+    cosmos_container: str = "models"
 
     # Application
     debug: bool = False
     host: str = "0.0.0.0"
     port: int = 8000
+    api_prefix: str = "/api/v1"
+
+    # Logging
+    log_level: str = "INFO"
+
+    # Cache (Redis - opcional)
+    redis_url: Optional[str] = None
+    cache_ttl: int = 3600
 
     class Config:
         env_file = ".env"
@@ -1530,349 +1157,3 @@ class Settings(BaseSettings):
 def get_settings():
     return Settings()
 ```
-
-### 5. Aplicação FastAPI
-
-#### `main.py`
-```python
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-from infrastructure.web.fastapi_controllers import router
-from infrastructure.config.settings import get_settings
-
-def create_app() -> FastAPI:
-    """Factory para criar a aplicação FastAPI"""
-
-    settings = get_settings()
-
-    app = FastAPI(
-        title="Sistema de Biblioteca Digital",
-        description="API para gerenciamento de biblioteca com arquitetura hexagonal",
-        version="1.0.0",
-        debug=settings.debug
-    )
-
-    # Middleware
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # Routers
-    app.include_router(router, prefix="/api/v1")
-
-    @app.get("/health")
-    async def health_check():
-        return {"status": "healthy", "message": "Library API is running"}
-
-    return app
-
-app = create_app()
-
-if __name__ == "__main__":
-    import uvicorn
-    settings = get_settings()
-    uvicorn.run(
-        "main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.debug
-    )
-```
-
-### 6. Testes
-
-#### `tests/unit/test_book_entity.py`
-```python
-import pytest
-from datetime import datetime
-from uuid import uuid4
-
-from domain.entities.book import Book
-from domain.value_objects.isbn import ISBN
-
-class TestBookEntity:
-    """Testes unitários para entidade Book"""
-
-    def test_create_valid_book(self):
-        """Teste: criar livro válido"""
-        book = Book(
-            title="Clean Architecture",
-            author="Robert C. Martin",
-            isbn=ISBN("9780134494166"),
-            total_copies=5,
-            available_copies=5
-        )
-
-        assert book.title == "Clean Architecture"
-        assert book.author == "Robert C. Martin"
-        assert book.isbn.value == "9780134494166"
-        assert book.total_copies == 5
-        assert book.available_copies == 5
-        assert book.is_available() is True
-
-    def test_book_without_title_raises_error(self):
-        """Teste: livro sem título deve gerar erro"""
-        with pytest.raises(ValueError, match="Título é obrigatório"):
-            Book(
-                title="",
-                author="Robert C. Martin",
-                isbn=ISBN("9780134494166"),
-                total_copies=5,
-                available_copies=5
-            )
-
-    def test_borrow_copy_decreases_availability(self):
-        """Teste: emprestar cópia diminui disponibilidade"""
-        book = Book(
-            title="Clean Code",
-            author="Robert C. Martin",
-            isbn=ISBN("9780132350884"),
-            total_copies=3,
-            available_copies=3
-        )
-
-        book.borrow_copy()
-
-        assert book.available_copies == 2
-        assert book.total_copies == 3
-        assert book.is_available() is True
-
-    def test_borrow_last_copy_makes_unavailable(self):
-        """Teste: emprestar última cópia torna indisponível"""
-        book = Book(
-            title="The Pragmatic Programmer",
-            author="David Thomas",
-            isbn=ISBN("9780201616224"),
-            total_copies=1,
-            available_copies=1
-        )
-
-        book.borrow_copy()
-
-        assert book.available_copies == 0
-        assert book.is_available() is False
-
-    def test_borrow_unavailable_book_raises_error(self):
-        """Teste: emprestar livro indisponível deve gerar erro"""
-        book = Book(
-            title="Design Patterns",
-            author="Gang of Four",
-            isbn=ISBN("9780201633610"),
-            total_copies=2,
-            available_copies=0
-        )
-
-        with pytest.raises(ValueError, match="não possui cópias disponíveis"):
-            book.borrow_copy()
-
-    def test_return_copy_increases_availability(self):
-        """Teste: devolver cópia aumenta disponibilidade"""
-        book = Book(
-            title="Refactoring",
-            author="Martin Fowler",
-            isbn=ISBN("9780201485677"),
-            total_copies=3,
-            available_copies=1
-        )
-
-        book.return_copy()
-
-        assert book.available_copies == 2
-        assert book.total_copies == 3
-
-    def test_add_copies_increases_total_and_available(self):
-        """Teste: adicionar cópias aumenta total e disponível"""
-        book = Book(
-            title="Domain-Driven Design",
-            author="Eric Evans",
-            isbn=ISBN("9780321125217"),
-            total_copies=2,
-            available_copies=1
-        )
-
-        book.add_copies(3)
-
-        assert book.total_copies == 5
-        assert book.available_copies == 4
-```
-
-#### `tests/integration/test_book_use_cases.py`
-```python
-import pytest
-from unittest.mock import AsyncMock, Mock
-from uuid import uuid4
-
-from application.use_cases.book_management import CreateBookUseCase, FindBookUseCase
-from domain.entities.book import Book
-from domain.value_objects.isbn import ISBN
-
-class TestBookUseCases:
-    """Testes de integração para casos de uso de livros"""
-
-    @pytest.fixture
-    def mock_book_repository(self):
-        """Mock do repositório de livros"""
-        return AsyncMock()
-
-    @pytest.fixture
-    def create_book_use_case(self, mock_book_repository):
-        """Instância do caso de uso de criação"""
-        return CreateBookUseCase(mock_book_repository)
-
-    @pytest.fixture
-    def find_book_use_case(self, mock_book_repository):
-        """Instância do caso de uso de busca"""
-        return FindBookUseCase(mock_book_repository)
-
-    @pytest.mark.asyncio
-    async def test_create_book_success(self, create_book_use_case, mock_book_repository):
-        """Teste: criar livro com sucesso"""
-        # Arrange
-        mock_book_repository.find_by_isbn.return_value = None  # ISBN não existe
-        mock_book_repository.save.return_value = Book(
-            id=uuid4(),
-            title="Test Book",
-            author="Test Author",
-            isbn=ISBN("9780134494166"),
-            total_copies=5,
-            available_copies=5
-        )
-
-        # Act
-        result = await create_book_use_case.execute(
-            title="Test Book",
-            author="Test Author",
-            isbn="9780134494166",
-            total_copies=5
-        )
-
-        # Assert
-        assert result.title == "Test Book"
-        assert result.author == "Test Author"
-        assert result.isbn.value == "9780134494166"
-        mock_book_repository.find_by_isbn.assert_called_once_with("9780134494166")
-        mock_book_repository.save.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_create_book_duplicate_isbn_fails(self, create_book_use_case, mock_book_repository):
-        """Teste: criar livro com ISBN duplicado deve falhar"""
-        # Arrange
-        existing_book = Book(
-            title="Existing Book",
-            author="Existing Author",
-            isbn=ISBN("9780134494166"),
-            total_copies=3,
-            available_copies=3
-        )
-        mock_book_repository.find_by_isbn.return_value = existing_book
-
-        # Act & Assert
-        with pytest.raises(ValueError, match="Já existe um livro com ISBN"):
-            await create_book_use_case.execute(
-                title="New Book",
-                author="New Author",
-                isbn="9780134494166",
-                total_copies=5
-            )
-
-        mock_book_repository.save.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_find_book_by_id_success(self, find_book_use_case, mock_book_repository):
-        """Teste: buscar livro por ID com sucesso"""
-        # Arrange
-        book_id = uuid4()
-        expected_book = Book(
-            id=book_id,
-            title="Found Book",
-            author="Found Author",
-            isbn=ISBN("9780134494166"),
-            total_copies=5,
-            available_copies=3
-        )
-        mock_book_repository.find_by_id.return_value = expected_book
-
-        # Act
-        result = await find_book_use_case.execute_by_id(book_id)
-
-        # Assert
-        assert result == expected_book
-        mock_book_repository.find_by_id.assert_called_once_with(book_id)
-
-    @pytest.mark.asyncio
-    async def test_find_book_by_id_not_found(self, find_book_use_case, mock_book_repository):
-        """Teste: buscar livro inexistente retorna None"""
-        # Arrange
-        book_id = uuid4()
-        mock_book_repository.find_by_id.return_value = None
-
-        # Act
-        result = await find_book_use_case.execute_by_id(book_id)
-
-        # Assert
-        assert result is None
-        mock_book_repository.find_by_id.assert_called_once_with(book_id)
-```
-
-## 🎯 Benefícios da Arquitetura Hexagonal Demonstrados
-
-### 1. **Testabilidade**
-- **Domínio isolado**: Entidades e value objects podem ser testados sem dependências externas
-- **Mocks simples**: Interfaces permitem mocks fáceis nos testes
-- **Diferentes níveis**: Testes unitários, de integração e E2E independentes
-
-### 2. **Flexibilidade**
-- **Troca de banco**: Podemos trocar PostgreSQL por MongoDB sem afetar o domínio
-- **Troca de framework**: FastAPI pode ser substituído por Flask sem mudanças no core
-- **Múltiplos adapters**: Web API, CLI, desktop app usando a mesma lógica
-
-### 3. **Manutenibilidade**
-- **Separação clara**: Cada camada tem responsabilidade bem definida
-- **Baixo acoplamento**: Mudanças em uma camada não afetam outras
-- **Alto coesão**: Código relacionado está agrupado
-
-### 4. **Extensibilidade**
-- **Novos use cases**: Fácil adição de novas funcionalidades
-- **Novos adapters**: Simples implementação de novos pontos de entrada/saída
-- **Novas regras**: Lógica de negócio centralizada e fácil de modificar
-
-## 🚀 Como Executar o Exemplo
-
-### 1. Instalar Dependências
-```bash
-pip install fastapi uvicorn sqlalchemy psycopg2-binary alembic pytest pytest-asyncio
-```
-
-### 2. Configurar Banco de Dados
-```bash
-# PostgreSQL
-createdb library_db
-
-# Executar migrações (usando Alembic)
-alembic upgrade head
-```
-
-### 3. Configurar Variáveis de Ambiente
-```bash
-export DATABASE_URL="postgresql://user:password@localhost/library_db"
-export SMTP_HOST="smtp.gmail.com"
-export SMTP_USERNAME="your-email@gmail.com"
-export SMTP_PASSWORD="your-app-password"
-```
-
-### 4. Executar Aplicação
-```bash
-python main.py
-```
-
-### 5. Executar Testes
-```bash
-pytest tests/ -v
-```
-
-Esta implementação demonstra na prática todos os conceitos da arquitetura hexagonal com um exemplo real e completo que pode ser executado e testado.
